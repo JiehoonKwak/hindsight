@@ -204,6 +204,8 @@ function buildSurveyPlan(
       // self-contained (doesn't require the user's config.toml to already have hindsight). Model is
       // left to Codex's configured default — Codex model ids differ from Claude's, and the read-only
       // sandbox + the bounded prompt are the cost/safety controls (Codex has no per-run budget flag).
+      // `codex exec` cannot answer approval prompts, so preapprove only the ingestion tool that this
+      // background survey needs; the read-only sandbox still prevents repository writes.
       return {
         bin,
         args: [
@@ -216,6 +218,8 @@ function buildSurveyPlan(
           `mcp_servers.hindsight.args=["${opts.mcpServerPath}"]`,
           "-c",
           `mcp_servers.hindsight.env.HINDSIGHT_MCP_PROJECT_CWD="${repoDir}"`,
+          "-c",
+          `mcp_servers.hindsight.tools.hindsight_ingest_document.approval_mode="approve"`,
           SURVEY_PROMPT,
         ],
         env,
