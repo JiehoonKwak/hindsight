@@ -5,7 +5,7 @@ vector distance (VECTOR_DISTANCE), full-text search (Oracle Text), and
 other non-portable patterns.
 """
 
-from .base import SQLDialect
+from .base import KnowledgePageTextSearchPlan, SQLDialect
 
 
 class OracleDialect(SQLDialect):
@@ -112,6 +112,27 @@ class OracleDialect(SQLDialect):
 
     def text_search_order(self, col: str, query_param: str, *, index_name: str | None = None) -> str:
         return "SCORE(1) DESC"
+
+    def knowledge_page_text_search_plan(
+        self,
+        *,
+        query_param: str,
+        text_search_extension: str,
+        native_language: str,
+    ) -> KnowledgePageTextSearchPlan:
+        """Keep Knowledge Page search vector-only on Oracle.
+
+        Oracle's baseline has a CTXSYS index for ``memory_units.text`` but not
+        for ``mental_models.content``. A false lexical arm preserves vector
+        search without pretending that Knowledge Page text search is indexed.
+        The bind remains referenced because python-oracledb rejects unused binds.
+        """
+        del text_search_extension, native_language
+        return KnowledgePageTextSearchPlan(
+            score_expression="0",
+            match_condition=f"{query_param} IS NULL AND 1 = 0",
+            order_by="mm.id",
+        )
 
     # -- Fuzzy string matching -------------------------------------------
 

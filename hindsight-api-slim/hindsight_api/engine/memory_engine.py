@@ -13333,11 +13333,10 @@ class MemoryEngine(MemoryEngineInterface):
     ) -> list[dict[str, Any]]:
         """Doc-level hybrid search over a bank's knowledge pages.
 
-        Fuses a full-text match (``mm.search_vector``, a generated tsvector over the
-        page name + content) with vector similarity (``mm.embedding``) using
-        Reciprocal Rank Fusion, in a single round trip. No reranker — this path is
-        tuned for latency. Returns pages ranked by fused score, each with a short
-        content snippet. Folders are excluded.
+        Fuses backend-specific lexical search with vector similarity
+        (``mm.embedding``) using Reciprocal Rank Fusion, in a single round trip.
+        No reranker — this path is tuned for latency. Returns pages ranked by
+        fused score, each with a short content snippet. Folders are excluded.
         """
         await self._authenticate_tenant(request_context)
         query = (query or "").strip()
@@ -13358,28 +13357,39 @@ class MemoryEngine(MemoryEngineInterface):
         join = self._kp_join()
 
         backend = await self._get_backend()
+        assert self._dialect is not None
+        config = get_config()
         async with acquire_with_retry(backend) as conn:
             if emb_str is not None:
-                # Vector arm (ANN over mm.embedding) + BM25 arm (mm.search_vector),
-                # each ranked independently, then RRF-fused (k=60) in SQL.
+                embedding_param = self._dialect.param(1)
+                bank_param = self._dialect.param(2)
+                query_param = self._dialect.param(3)
+                vector_distance = self._dialect.vector_distance("mm.embedding", embedding_param)
+                text_plan = self._dialect.knowledge_page_text_search_plan(
+                    query_param=query_param,
+                    text_search_extension=config.text_search_extension,
+                    native_language=config.text_search_extension_native_language,
+                )
+                # Vector and lexical arms are ranked independently, then
+                # RRF-fused (k=60). The dialect owns the non-portable operators.
                 sql = f"""
                     WITH vec AS (
                         SELECT kp.id AS page_id,
-                               ROW_NUMBER() OVER (ORDER BY mm.embedding <=> $1::vector) AS rnk
+                               ROW_NUMBER() OVER (ORDER BY {vector_distance}) AS rnk
                         FROM {join}
-                        WHERE kp.bank_id = $2 AND kp.kind = 'page' AND mm.embedding IS NOT NULL
-                        ORDER BY mm.embedding <=> $1::vector
+                        WHERE kp.bank_id = {bank_param} AND kp.kind = 'page' AND mm.embedding IS NOT NULL
+                        ORDER BY {vector_distance}
                         LIMIT {fetch}
                     ),
                     bm AS (
                         SELECT kp.id AS page_id,
                                ROW_NUMBER() OVER (
-                                   ORDER BY ts_rank_cd(mm.search_vector, websearch_to_tsquery('english', $3)) DESC
+                                   ORDER BY {text_plan.order_by}
                                ) AS rnk
                         FROM {join}
-                        WHERE kp.bank_id = $2 AND kp.kind = 'page'
-                              AND mm.search_vector @@ websearch_to_tsquery('english', $3)
-                        ORDER BY ts_rank_cd(mm.search_vector, websearch_to_tsquery('english', $3)) DESC
+                        WHERE kp.bank_id = {bank_param} AND kp.kind = 'page'
+                              AND ({text_plan.match_condition})
+                        ORDER BY {text_plan.order_by}
                         LIMIT {fetch}
                     ),
                     fused AS (
@@ -13388,9 +13398,10 @@ class MemoryEngine(MemoryEngineInterface):
                         FROM vec FULL OUTER JOIN bm ON vec.page_id = bm.page_id
                     )
                     SELECT kp.id, kp.name, kp.mental_model_id,
-                           LEFT(mm.content, 280) AS snippet, mm.last_refreshed_at AS updated_at, f.score
+                           SUBSTR(mm.content, 1, 280) AS snippet,
+                           mm.last_refreshed_at AS updated_at, f.score
                     FROM fused f
-                    JOIN {kp} kp ON kp.id = f.page_id AND kp.bank_id = $2
+                    JOIN {kp} kp ON kp.id = f.page_id AND kp.bank_id = {bank_param}
                     LEFT JOIN {mm} mm ON mm.id = kp.mental_model_id AND mm.bank_id = kp.bank_id
                     ORDER BY f.score DESC
                     LIMIT {limit}
@@ -13398,14 +13409,22 @@ class MemoryEngine(MemoryEngineInterface):
                 rows = await conn.fetch(sql, emb_str, bank_id, query)
             else:
                 # Embedding unavailable → BM25-only fallback (still useful).
+                bank_param = self._dialect.param(1)
+                query_param = self._dialect.param(2)
+                text_plan = self._dialect.knowledge_page_text_search_plan(
+                    query_param=query_param,
+                    text_search_extension=config.text_search_extension,
+                    native_language=config.text_search_extension_native_language,
+                )
                 sql = f"""
                     SELECT kp.id, kp.name, kp.mental_model_id,
-                           LEFT(mm.content, 280) AS snippet, mm.last_refreshed_at AS updated_at,
-                           ts_rank_cd(mm.search_vector, websearch_to_tsquery('english', $2)) AS score
+                           SUBSTR(mm.content, 1, 280) AS snippet,
+                           mm.last_refreshed_at AS updated_at,
+                           {text_plan.score_expression} AS score
                     FROM {join}
-                    WHERE kp.bank_id = $1 AND kp.kind = 'page'
-                          AND mm.search_vector @@ websearch_to_tsquery('english', $2)
-                    ORDER BY score DESC
+                    WHERE kp.bank_id = {bank_param} AND kp.kind = 'page'
+                          AND ({text_plan.match_condition})
+                    ORDER BY {text_plan.order_by}
                     LIMIT {limit}
                 """
                 rows = await conn.fetch(sql, bank_id, query)

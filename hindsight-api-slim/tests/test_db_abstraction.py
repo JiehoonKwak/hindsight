@@ -5,7 +5,10 @@ without requiring a live database connection.
 """
 
 import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -145,6 +148,113 @@ class TestPostgreSQLDialect:
     def test_text_search_score_tsvector(self, d):
         result = d.text_search_score("text", "$1")
         assert "ts_rank_cd" in result
+
+    @pytest.mark.parametrize(
+        ("extension", "score_fragment", "match_fragment"),
+        [
+            (
+                "native",
+                "ts_rank_cd(mm.search_vector, websearch_to_tsquery('french', $3))",
+                "mm.search_vector @@ websearch_to_tsquery('french', $3)",
+            ),
+            (
+                "vchord",
+                "-(mm.search_vector <&> to_bm25query('idx_mental_models_text_search', tokenize($3, 'llmlingua2')))",
+                "> 0",
+            ),
+            (
+                "pg_textsearch",
+                "-(mm.content <@> to_bm25query($3, 'idx_mental_models_text_search'))",
+                "mm.content <@> to_bm25query($3, 'idx_mental_models_text_search') < 0",
+            ),
+            (
+                "pgroonga",
+                "pgroonga_score(mm.tableoid, mm.ctid)",
+                "(COALESCE(mm.name, '') || ' ' || mm.content) &@~ pgroonga_query_escape($3)",
+            ),
+            (
+                "pg_search",
+                "paradedb.score(mm.id)",
+                "mm.id @@@ paradedb.boolean(should => ARRAY[",
+            ),
+        ],
+    )
+    def test_knowledge_page_text_search_plan_is_backend_aware(
+        self,
+        d,
+        extension,
+        score_fragment,
+        match_fragment,
+    ):
+        plan = d.knowledge_page_text_search_plan(
+            query_param="$3",
+            text_search_extension=extension,
+            native_language="french",
+        )
+
+        assert score_fragment in plan.score_expression
+        assert match_fragment in plan.match_condition
+        assert plan.order_by.endswith((" ASC", " DESC"))
+
+    def test_knowledge_page_pg_search_plan_targets_both_indexed_fields(self, d):
+        plan = d.knowledge_page_text_search_plan(
+            query_param="$3",
+            text_search_extension="pg_search",
+            native_language="english",
+        )
+
+        assert "paradedb.match('name', $3)" in plan.match_condition
+        assert "paradedb.match('content', $3)" in plan.match_condition
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("embedding", [[[0.1, 0.2]], []])
+    async def test_knowledge_page_search_uses_backend_plan_with_or_without_embedding(
+        self,
+        monkeypatch,
+        embedding,
+    ):
+        from hindsight_api.engine.memory_engine import MemoryEngine
+
+        engine = object.__new__(MemoryEngine)
+        engine.embeddings = object()
+        engine._dialect = PostgreSQLDialect()
+        engine._authenticate_tenant = AsyncMock()
+        engine._get_backend = AsyncMock(return_value=object())
+
+        conn = AsyncMock(spec=DatabaseConnection)
+        conn.fetch.return_value = []
+
+        @asynccontextmanager
+        async def fake_acquire(_backend: object) -> AsyncIterator[DatabaseConnection]:
+            yield conn
+
+        monkeypatch.setattr("hindsight_api.engine.memory_engine.acquire_with_retry", fake_acquire)
+        monkeypatch.setattr(
+            "hindsight_api.engine.retain.embedding_utils.generate_embeddings_batch",
+            AsyncMock(return_value=embedding),
+        )
+        monkeypatch.setattr(
+            "hindsight_api.engine.memory_engine.get_config",
+            lambda: SimpleNamespace(
+                database_backend="postgresql",
+                database_schema="public",
+                text_search_extension="pgroonga",
+                text_search_extension_native_language="english",
+            ),
+        )
+
+        results = await MemoryEngine.search_knowledge_pages(
+            engine,
+            "bank",
+            "한글 English",
+            request_context=object(),
+        )
+
+        assert results == []
+        sql = conn.fetch.await_args.args[0]
+        assert "&@~ pgroonga_query_escape" in sql
+        assert "pgroonga_score(mm.tableoid, mm.ctid)" in sql
+        assert "ts_rank_cd" not in sql
 
     def test_similarity(self, d):
         assert d.similarity("col", "$1") == "similarity(col, $1)"
@@ -399,6 +509,16 @@ class TestOracleDialect:
 
     def test_current_timestamp(self, d):
         assert d.current_timestamp() == "SYSTIMESTAMP"
+
+    def test_knowledge_page_text_plan_disables_unindexed_lexical_arm(self, d):
+        plan = d.knowledge_page_text_search_plan(
+            query_param=":3",
+            text_search_extension="native",
+            native_language="english",
+        )
+
+        assert ":3" in plan.match_condition
+        assert "1 = 0" in plan.match_condition
 
     def test_build_semantic_arm(self, d):
         arm = d.build_semantic_arm(

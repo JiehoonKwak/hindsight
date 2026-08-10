@@ -5,6 +5,20 @@ Business logic calls these methods instead of embedding raw SQL fragments.
 """
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class KnowledgePageTextSearchPlan:
+    """Database-owned SQL fragments for a Knowledge Page lexical-search arm.
+
+    Scores are normalized so larger values always mean a better match. The
+    match condition must exclude non-matches before rank fusion.
+    """
+
+    score_expression: str
+    match_condition: str
+    order_by: str
 
 
 class SQLDialect(ABC):
@@ -145,6 +159,22 @@ class SQLDialect(ABC):
 
         Returns:
             Expression suitable for ORDER BY ... ASC.
+        """
+        ...
+
+    @abstractmethod
+    def knowledge_page_text_search_plan(
+        self,
+        *,
+        query_param: str,
+        text_search_extension: str,
+        native_language: str,
+    ) -> KnowledgePageTextSearchPlan:
+        """Build the lexical-search expressions for ``mental_models``.
+
+        Knowledge Pages live on the ``mental_models`` table (alias ``mm``).
+        Column types, match operators, score direction, and index contracts vary
+        by database and text-search extension, so they belong to the dialect.
         """
         ...
 

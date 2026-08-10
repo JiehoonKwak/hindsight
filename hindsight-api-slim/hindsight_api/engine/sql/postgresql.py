@@ -5,7 +5,7 @@ vector distance (pgvector), full-text search (VectorChord BM25 / tsvector),
 and other non-portable patterns.
 """
 
-from .base import SQLDialect
+from .base import KnowledgePageTextSearchPlan, SQLDialect
 
 
 class PostgreSQLDialect(SQLDialect):
@@ -54,6 +54,70 @@ class PostgreSQLDialect(SQLDialect):
             # VectorChord BM25 — lower distance = better, so ASC
             return f"{col} <@> to_bm25query({query_param}, '{index_name}') ASC"
         return f"ts_rank_cd({col}, to_tsquery({query_param})) DESC"
+
+    def knowledge_page_text_search_plan(
+        self,
+        *,
+        query_param: str,
+        text_search_extension: str,
+        native_language: str,
+    ) -> KnowledgePageTextSearchPlan:
+        """Return the lexical plan matching ``idx_mental_models_text_search``."""
+        if text_search_extension == "vchord":
+            # <&> returns negative BM25. Negate it so all plans expose a score
+            # where larger is better, and gate zero-score padded rows.
+            score = (
+                "-(mm.search_vector <&> to_bm25query('idx_mental_models_text_search', "
+                f"tokenize({query_param}, 'llmlingua2')))"
+            )
+            return KnowledgePageTextSearchPlan(
+                score_expression=score,
+                match_condition=f"{score} > 0",
+                order_by=f"{score} DESC",
+            )
+
+        if text_search_extension == "pg_textsearch":
+            # The shipped mental-model migration indexes ``content``. <@>
+            # returns negative BM25; zero is a non-match.
+            distance = f"mm.content <@> to_bm25query({query_param}, 'idx_mental_models_text_search')"
+            return KnowledgePageTextSearchPlan(
+                score_expression=f"-({distance})",
+                match_condition=f"{distance} < 0",
+                order_by=f"{distance} ASC",
+            )
+
+        if text_search_extension == "pgroonga":
+            score = "pgroonga_score(mm.tableoid, mm.ctid)"
+            # This must repeat the PGroonga expression-index definition exactly.
+            document = "(COALESCE(mm.name, '') || ' ' || mm.content)"
+            return KnowledgePageTextSearchPlan(
+                score_expression=score,
+                match_condition=f"{document} &@~ pgroonga_query_escape({query_param})",
+                order_by=f"{score} DESC",
+            )
+
+        if text_search_extension == "pg_search":
+            score = "paradedb.score(mm.id)"
+            match = (
+                "mm.id @@@ paradedb.boolean(should => ARRAY["
+                f"paradedb.match('name', {query_param}), "
+                f"paradedb.match('content', {query_param})"
+                "])"
+            )
+            return KnowledgePageTextSearchPlan(
+                score_expression=score,
+                match_condition=match,
+                order_by=f"{score} DESC",
+            )
+
+        # The language is validated as a PostgreSQL identifier in config.
+        tsquery = f"websearch_to_tsquery('{native_language}', {query_param})"
+        score = f"ts_rank_cd(mm.search_vector, {tsquery})"
+        return KnowledgePageTextSearchPlan(
+            score_expression=score,
+            match_condition=f"mm.search_vector @@ {tsquery}",
+            order_by=f"{score} DESC",
+        )
 
     # -- Fuzzy string matching -------------------------------------------
 
