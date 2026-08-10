@@ -7,6 +7,7 @@ and other non-portable patterns.
 
 from dataclasses import dataclass
 
+from ..._text_search import mental_models_text_document
 from .base import SQLDialect
 
 
@@ -45,8 +46,9 @@ def knowledge_bm25_arm(
     ``table_alias`` is the alias the ``mental_models`` row carries in the query
     (``mm``); ``text_param`` is the bind placeholder holding the query text.
 
-    PGroonga keeps the migration-time generated tsvector as a rollback projection,
-    but queries the multilingual expression index over ``name + content``.
+    ``pgroonga`` queries the multilingual expression index over ``name +
+    content``; ``ensure_text_search_extension`` reconciles ``mental_models`` to
+    that shape (dummy TEXT ``search_vector``) like every other pgroonga table.
     """
     a = table_alias
     p = text_param
@@ -92,13 +94,18 @@ def knowledge_bm25_arm(
         )
 
     if text_search_extension == "pgroonga":
+        # Same operator/score pair as build_bm25_arm's pgroonga form. The filter
+        # repeats idx_mental_models_text_search's indexed expression verbatim (via
+        # the shared helper) so the planner can select that expression index —
+        # pgroonga_score() only returns a real score off a pgroonga index scan and
+        # silently reads 0 for every row otherwise, so the id tiebreak keeps the
+        # arm's ordering deterministic if the planner ever picks another plan.
+        # pgroonga_query_escape neutralises operator characters in user text.
         score = f"pgroonga_score({a}.tableoid, {a}.ctid)"
-        # Repeat idx_mental_models_text_search's expression exactly so PostgreSQL
-        # can select the PGroonga expression index.
-        document = f"(COALESCE({a}.name, '') || ' ' || {a}.content)"
+        document = mental_models_text_document(a)
         return KnowledgeBm25Arm(
             score_expr=score,
-            order_by=f"{score} DESC",
+            order_by=f"{score} DESC, {a}.id",
             match_filter=f"AND {document} &@~ pgroonga_query_escape({p})",
         )
 

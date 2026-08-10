@@ -11,6 +11,7 @@ assert on the generated SQL, the way ``test_multilingual_bm25`` does.
 
 from types import SimpleNamespace
 
+from hindsight_api._text_search import mental_models_text_document
 from hindsight_api.engine.db.ops_postgresql import pg_search_vector_expr
 from hindsight_api.engine.sql.postgresql import KnowledgeBm25Arm, knowledge_bm25_arm
 
@@ -34,9 +35,17 @@ def test_native_uses_tsvector_operators():
 def test_pgroonga_uses_multilingual_expression_index():
     arm = _arm("pgroonga")
     assert arm.score_expr == "pgroonga_score(mm.tableoid, mm.ctid)"
-    assert arm.order_by == "pgroonga_score(mm.tableoid, mm.ctid) DESC"
-    assert arm.match_filter == ("AND (COALESCE(mm.name, '') || ' ' || mm.content) &@~ pgroonga_query_escape($3)")
-    assert "ts_rank_cd" not in arm.score_expr
+    assert arm.match_filter == "AND (COALESCE(mm.name, '') || ' ' || mm.content) &@~ pgroonga_query_escape($3)"
+    # pgroonga_score() reads 0 off any plan that did not use the pgroonga index,
+    # so the ordering carries a tiebreak instead of collapsing to input order.
+    assert arm.order_by == "pgroonga_score(mm.tableoid, mm.ctid) DESC, mm.id"
+
+
+def test_pgroonga_filter_repeats_the_indexed_expression_verbatim():
+    """The expression index is only selectable when the query repeats its
+    expression exactly — so both sides must come from the shared helper."""
+    assert mental_models_text_document("mm") in _arm("pgroonga").match_filter
+    assert mental_models_text_document() == "(COALESCE(name, '') || ' ' || content)"
 
 
 def test_pg_search_uses_paradedb_over_base_columns():

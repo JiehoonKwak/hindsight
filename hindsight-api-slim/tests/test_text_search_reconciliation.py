@@ -1,11 +1,25 @@
-"""Regression coverage for runtime text-search reconciliation."""
+"""Regression coverage for runtime text-search reconciliation.
 
+``ensure_text_search_extension`` issues DDL against a live database at startup,
+so these tests drive it through a fake connection that records every statement.
+The assertions are about *which* statements are emitted (and that they are all
+re-executable), not about a real schema — the shapes themselves are covered by
+the migration suites.
+"""
+
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 
 import pytest
 
 from hindsight_api import migrations
+from hindsight_api._text_search import mental_models_text_document
+
+_COUNT_TABLE = re.compile(r"SELECT COUNT\(\*\) FROM \S+\.(\w+)")
+# Statements that change the schema; each one must be safely re-executable
+# because replicas boot concurrently and all run this reconciliation.
+_DDL_PREFIXES = ("ALTER", "CREATE", "DROP")
 
 
 class _Result:
@@ -48,13 +62,18 @@ class _Connection:
         if "FROM pg_indexes" in sql:
             table = self.tables[params["table_name"]]
             return _Result(row=(table.index, table.indexdef) if table.index else None)
-        if sql.lstrip().startswith("SELECT COUNT(*)"):
-            table_name = sql.split(".", 1)[1].split()[0]
-            return _Result(scalar=self.tables[table_name].rows)
+        count_target = _COUNT_TABLE.search(" ".join(sql.split()))
+        if count_target:
+            return _Result(scalar=self.tables[count_target.group(1)].rows)
         return _Result()
 
     def commit(self):
         self.commits += 1
+
+    @property
+    def ddl(self) -> list[str]:
+        normalized = (" ".join(s.split()) for s in self.statements)
+        return [s for s in normalized if s.startswith(_DDL_PREFIXES)]
 
 
 class _Engine:
@@ -66,18 +85,27 @@ class _Engine:
         yield self.conn
 
 
-def _run(monkeypatch, tables: dict[str, _TableState], extension="pgroonga"):
+def _connect(monkeypatch, tables: dict[str, _TableState]) -> _Connection:
     conn = _Connection(tables)
     monkeypatch.setattr(migrations, "create_engine", lambda *args, **kwargs: _Engine(conn))
+    return conn
+
+
+def _run(monkeypatch, tables: dict[str, _TableState], extension="pgroonga") -> _Connection:
+    conn = _connect(monkeypatch, tables)
     migrations.ensure_text_search_extension("postgresql://unused", text_search_extension=extension)
     return conn
 
 
-def _normalized_statements(conn):
-    return [" ".join(statement.split()) for statement in conn.statements]
+def _assert_no_schema_changes(conn: _Connection) -> None:
+    assert conn.ddl == []
+    assert conn.commits == 0
 
 
-def test_populated_legacy_mental_models_adds_pgroonga_without_losing_native_rollback(monkeypatch):
+def test_populated_legacy_mental_models_converts_to_pgroonga(monkeypatch):
+    """The one populated transition that is allowed: the derived tsvector that
+    reconciliation used to skip (it checked the pre-rename `reflections` name)
+    is replaced by the pgroonga expression index. Nothing needs a backfill."""
     conn = _run(
         monkeypatch,
         {
@@ -85,70 +113,87 @@ def test_populated_legacy_mental_models_adds_pgroonga_without_losing_native_roll
             "mental_models": _TableState(column="tsvector", index="gin", rows=5),
         },
     )
-    statements = _normalized_statements(conn)
 
     assert conn.table_checks == ["memory_units", "mental_models"]
-    assert any(
-        "ALTER INDEX public.idx_mental_models_text_search RENAME TO idx_mental_models_text_search_native" in statement
-        for statement in statements
-    )
-    assert not any("DROP COLUMN" in statement and "mental_models" in statement for statement in statements)
-    assert any(
-        "CREATE INDEX idx_mental_models_text_search ON public.mental_models "
-        "USING pgroonga ((COALESCE(name, '') || ' ' || content))" in statement
-        for statement in statements
-    )
-    assert not any("DELETE FROM" in statement for statement in statements)
+    assert conn.ddl == [
+        "DROP INDEX IF EXISTS public.idx_mental_models_text_search",
+        "ALTER TABLE public.mental_models DROP COLUMN IF EXISTS search_vector",
+        "CREATE EXTENSION IF NOT EXISTS pgroonga CASCADE",
+        "ALTER TABLE public.mental_models ADD COLUMN IF NOT EXISTS search_vector TEXT",
+        "CREATE INDEX IF NOT EXISTS idx_mental_models_text_search ON public.mental_models "
+        f"USING pgroonga ({mental_models_text_document()}) "
+        "WITH (tokenizer='TokenBigram', normalizer='NormalizerNFKC150')",
+    ]
+    # memory_units already matched, so it is left alone entirely.
+    assert not any("memory_units" in statement for statement in conn.ddl)
     assert conn.commits == 1
 
 
-def test_dual_projection_pgroonga_state_is_idempotent(monkeypatch):
+def test_pgroonga_state_is_idempotent(monkeypatch):
     conn = _run(
         monkeypatch,
         {
             "memory_units": _TableState(column="text", index="pgroonga", rows=20),
-            "mental_models": _TableState(column="tsvector", index="pgroonga", rows=5),
+            "mental_models": _TableState(column="text", index="pgroonga", rows=5),
         },
     )
 
     assert conn.table_checks == ["memory_units", "mental_models"]
-    assert conn.commits == 0
-    assert not any(statement.lstrip().startswith(("ALTER", "CREATE", "DROP")) for statement in conn.statements)
+    _assert_no_schema_changes(conn)
 
 
 def test_populated_memory_units_backend_switch_remains_fail_closed(monkeypatch):
-    conn = _Connection(
+    conn = _connect(
+        monkeypatch,
         {
             "memory_units": _TableState(column="tsvector", index="gin", rows=20),
             "mental_models": _TableState(column="tsvector", index="gin", rows=5),
-        }
+        },
     )
-    monkeypatch.setattr(migrations, "create_engine", lambda *args, **kwargs: _Engine(conn))
 
     with pytest.raises(RuntimeError, match=r"memory_units\(20 rows\)"):
         migrations.ensure_text_search_extension("postgresql://unused", text_search_extension="pgroonga")
 
-    assert conn.commits == 0
-    assert not any(statement.lstrip().startswith(("ALTER", "CREATE", "DROP")) for statement in conn.statements)
+    _assert_no_schema_changes(conn)
 
 
 def test_populated_unknown_mental_model_index_remains_fail_closed(monkeypatch):
-    conn = _Connection(
+    """Only the native tsvector/GIN shape is derived-only; anything else may hold
+    values the reconciler cannot recompute, so it must still refuse."""
+    conn = _connect(
+        monkeypatch,
         {
             "memory_units": _TableState(column="text", index="pgroonga", rows=20),
             "mental_models": _TableState(column="tsvector", index="bm25", rows=5),
-        }
+        },
     )
-    monkeypatch.setattr(migrations, "create_engine", lambda *args, **kwargs: _Engine(conn))
 
     with pytest.raises(RuntimeError, match=r"mental_models\(5 rows\)"):
         migrations.ensure_text_search_extension("postgresql://unused", text_search_extension="pgroonga")
 
-    assert conn.commits == 0
-    assert not any(statement.lstrip().startswith(("ALTER", "CREATE", "DROP")) for statement in conn.statements)
+    _assert_no_schema_changes(conn)
 
 
-def test_empty_mental_models_native_reconcile_restores_generated_projection(monkeypatch):
+def test_populated_mental_models_backfill_backend_remains_fail_closed(monkeypatch):
+    """vchord's bm25vector must be tokenized per row on write, so converting a
+    populated table would leave every existing row unsearchable."""
+    conn = _connect(
+        monkeypatch,
+        {
+            "memory_units": _TableState(column="bm25vector", index="bm25", rows=20),
+            "mental_models": _TableState(column="tsvector", index="gin", rows=5),
+        },
+    )
+
+    with pytest.raises(RuntimeError, match=r"mental_models\(5 rows\)"):
+        migrations.ensure_text_search_extension("postgresql://unused", text_search_extension="vchord")
+
+    _assert_no_schema_changes(conn)
+
+
+def test_empty_mental_models_native_reconcile_creates_generated_projection(monkeypatch):
+    """No write path fills mental_models.search_vector for native, so the column
+    has to generate itself (see pg_search_vector_expr's native_inline=False)."""
     conn = _run(
         monkeypatch,
         {
@@ -157,10 +202,45 @@ def test_empty_mental_models_native_reconcile_restores_generated_projection(monk
         },
         extension="native",
     )
-    statements = _normalized_statements(conn)
 
-    assert any(
-        "ADD COLUMN search_vector tsvector GENERATED ALWAYS AS" in statement and "COALESCE(name, '')" in statement
-        for statement in statements
+    assert (
+        "ALTER TABLE public.mental_models ADD COLUMN IF NOT EXISTS search_vector tsvector "
+        f"GENERATED ALWAYS AS ( to_tsvector('english', {mental_models_text_document()}) ) STORED" in conn.ddl
     )
     assert conn.commits == 1
+
+
+def test_empty_memory_units_native_reconcile_creates_plain_column(monkeypatch):
+    conn = _run(
+        monkeypatch,
+        {
+            "memory_units": _TableState(column="text", index="pgroonga", rows=0),
+            "mental_models": _TableState(column="tsvector", index="gin", rows=0),
+        },
+        extension="native",
+    )
+
+    assert "ALTER TABLE public.memory_units ADD COLUMN IF NOT EXISTS search_vector tsvector" in conn.ddl
+
+
+@pytest.mark.parametrize("extension", ["native", "vchord", "pg_textsearch", "pgroonga", "pg_search"])
+def test_reconcile_ddl_is_re_executable(monkeypatch, extension):
+    """Replicas boot concurrently during a rolling restart and each runs this
+    reconciliation, so the loser of the race must not crash on DDL the winner
+    already committed."""
+    conn = _run(
+        monkeypatch,
+        {
+            "memory_units": _TableState(column=None, index=None, rows=0),
+            "mental_models": _TableState(column=None, index=None, rows=0),
+        },
+        extension=extension,
+    )
+
+    assert conn.ddl, "expected reconciliation to emit DDL"
+    for statement in conn.ddl:
+        assert re.match(
+            r"(CREATE (INDEX|EXTENSION) IF NOT EXISTS|DROP INDEX IF EXISTS"
+            r"|ALTER TABLE \S+ (ADD|DROP) COLUMN IF (NOT )?EXISTS)",
+            statement,
+        ), f"non re-executable DDL: {statement}"
