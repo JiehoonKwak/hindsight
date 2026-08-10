@@ -796,7 +796,8 @@ def ensure_text_search_extension(
     in the database and adjusts them if necessary:
     - If they match configured extension: no action needed
     - If they differ and tables are empty: drop old column/index, recreate with new type
-    - If they differ and tables have data: raise error with migration guidance
+    - If they differ and tables have data: raise error with migration guidance,
+      except for the derived-only mental-model native-to-PGroonga transition
 
     Args:
         database_url: SQLAlchemy database URL
@@ -816,10 +817,7 @@ def ensure_text_search_extension(
     engine = create_engine(to_libpq_url(database_url), poolclass=NullPool)
     with engine.connect() as conn:
         # Tables with search_vector columns to check
-        tables_to_check = [
-            "memory_units",
-            "reflections",  # Renamed from pinned_reflections in p1k2l3m4n5o6 migration
-        ]
+        tables_to_check = ["memory_units", "mental_models"]
 
         # Determine target column type and index type
         if text_search_extension == "vchord":
@@ -829,9 +827,9 @@ def ensure_text_search_extension(
             target_column_type = "text"
             target_index_type = "bm25"
         elif text_search_extension == "pgroonga":
-            # pgroonga indexes the base text column directly. We keep a dummy
-            # TEXT column named search_vector for symmetry with pg_textsearch
-            # and so the column-type mismatch detection above keeps working.
+            # PGroonga indexes the base text document directly. memory_units uses
+            # a dummy TEXT search_vector; a legacy mental_models tsvector is also
+            # accepted so it can remain as a rollback-compatible native projection.
             target_column_type = "text"
             target_index_type = "pgroonga"
         elif text_search_extension == "pg_search":
@@ -889,13 +887,19 @@ def ensure_text_search_extension(
                 text("""
                     SELECT am.amname, pi.indexdef
                     FROM pg_indexes pi
-                    JOIN pg_class c ON c.relname = pi.indexname
+                    JOIN pg_class c
+                      ON c.relname = pi.indexname
+                     AND c.relnamespace = to_regnamespace(pi.schemaname)
                     JOIN pg_am am ON am.oid = c.relam
                     WHERE pi.schemaname = :schema
                       AND pi.tablename = :table_name
-                      AND pi.indexname LIKE '%text_search%'
+                      AND pi.indexname = :index_name
                 """),
-                {"schema": schema_name, "table_name": table_name},
+                {
+                    "schema": schema_name,
+                    "table_name": table_name,
+                    "index_name": f"idx_{table_name.replace('.', '_')}_text_search",
+                },
             ).fetchone()
 
             current_index_type = current_index_info[0] if current_index_info else None
@@ -906,7 +910,12 @@ def ensure_text_search_extension(
             want_pg_search = text_search_extension == "pg_search"
 
             # Check if column and index types match target
-            column_matches = current_column_type == target_column_type
+            preserves_native_mental_models = (
+                text_search_extension == "pgroonga"
+                and table_name == "mental_models"
+                and current_column_type == "tsvector"
+            )
+            column_matches = current_column_type == target_column_type or preserves_native_mental_models
             index_matches = current_index_type == target_index_type if current_index_type else False
             # When both target and current sit at column=text/index=bm25, the
             # access-method check alone can't tell pg_textsearch from pg_search —
@@ -926,7 +935,8 @@ def ensure_text_search_extension(
                 # Check if table has data
                 row_count = conn.execute(text(f"SELECT COUNT(*) FROM {schema_name}.{table_name}")).scalar()
 
-                if row_count > 0:
+                safe_populated_reconcile = preserves_native_mental_models and current_index_type in {None, "gin"}
+                if row_count > 0 and not safe_populated_reconcile:
                     tables_with_data.append((table_name, row_count))
             else:
                 logger.debug(f"Text search OK for {table_name}: {current_column_type}/{current_index_type}")
@@ -960,25 +970,45 @@ def ensure_text_search_extension(
                 f"the following tables contain data: {table_list}. "
                 f"To change text search extension, you must either:\n"
                 f"  1. Clear all data: DELETE FROM {schema_name}.memory_units; "
-                f"DELETE FROM {schema_name}.reflections; then restart\n"
+                f"DELETE FROM {schema_name}.mental_models; then restart\n"
                 f"  2. Use the current text search extension (set HINDSIGHT_API_TEXT_SEARCH_EXTENSION='{current_ext}')"
             )
 
-        # Tables are empty, safe to recreate columns/indexes
+        # Tables are empty, except for the safe derived-only mental-model
+        # native-to-PGroonga transition admitted above.
         logger.info(f"Recreating text search columns/indexes for {text_search_extension}")
 
         for table_name, current_col_type, current_idx_type, _was_pg_search in mismatched_tables:
+            preserve_native_projection = (
+                text_search_extension == "pgroonga"
+                and table_name == "mental_models"
+                and current_col_type == "tsvector"
+                and current_idx_type in {None, "gin"}
+            )
+
             # Drop existing index if it exists
             if current_idx_type:
-                logger.info(f"Dropping {current_idx_type} index on {table_name}")
-                conn.execute(
-                    text(f"""
-                        DROP INDEX IF EXISTS {schema_name}.idx_{table_name.replace(".", "_")}_text_search
-                    """)
-                )
+                if preserve_native_projection:
+                    # Keep the native GIN index under a non-canonical name. New
+                    # code uses PGroonga while old rolling instances and rollback
+                    # builds can still run their tsvector query without a table scan.
+                    logger.info(f"Preserving native rollback index on {table_name}")
+                    conn.execute(
+                        text(f"""
+                            ALTER INDEX {schema_name}.idx_{table_name.replace(".", "_")}_text_search
+                            RENAME TO idx_{table_name.replace(".", "_")}_text_search_native
+                        """)
+                    )
+                else:
+                    logger.info(f"Dropping {current_idx_type} index on {table_name}")
+                    conn.execute(
+                        text(f"""
+                            DROP INDEX IF EXISTS {schema_name}.idx_{table_name.replace(".", "_")}_text_search
+                        """)
+                    )
 
             # Drop existing column if it exists
-            if current_col_type:
+            if current_col_type and not preserve_native_projection:
                 logger.info(f"Dropping {current_col_type} column on {table_name}")
                 conn.execute(text(f"ALTER TABLE {schema_name}.{table_name} DROP COLUMN IF EXISTS search_vector"))
 
@@ -1030,18 +1060,20 @@ def ensure_text_search_extension(
                     if not has_ext:
                         raise
 
-                logger.info(f"Creating dummy TEXT search_vector on {table_name} for pgroonga")
-                # pgroonga indexes the base text column directly, but we keep a
-                # dummy search_vector column for symmetry with pg_textsearch and
-                # so the column-type mismatch detection above keeps working.
-                conn.execute(text(f"ALTER TABLE {schema_name}.{table_name} ADD COLUMN search_vector TEXT"))
+                if preserve_native_projection:
+                    logger.info(f"Keeping native tsvector rollback projection on {table_name}")
+                else:
+                    logger.info(f"Creating dummy TEXT search_vector on {table_name} for pgroonga")
+                    # PGroonga indexes the base text column directly, but other
+                    # table shapes keep a dummy column for schema symmetry.
+                    conn.execute(text(f"ALTER TABLE {schema_name}.{table_name} ADD COLUMN search_vector TEXT"))
 
                 # pgroonga index expression mirrors pg_textsearch
                 if table_name == "memory_units":
                     index_expr = (
                         "(COALESCE(text, '') || ' ' || COALESCE(context, '') || ' ' || COALESCE(text_signals, ''))"
                     )
-                else:  # reflections
+                else:  # mental_models
                     index_expr = "(COALESCE(name, '') || ' ' || content)"
 
                 logger.info(f"Creating pgroonga index on {table_name}")
@@ -1088,11 +1120,22 @@ def ensure_text_search_extension(
                 )
             else:  # native
                 logger.info(f"Creating tsvector column on {table_name}")
-                # Plain tsvector column. The application populates search_vector
-                # at INSERT time via to_tsvector($lang, ...) using the configured
-                # HINDSIGHT_API_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE — see
-                # ops_postgresql.insert_facts_batch.
-                conn.execute(text(f"ALTER TABLE {schema_name}.{table_name} ADD COLUMN search_vector tsvector"))
+                if table_name == "mental_models":
+                    # Mental-model write paths rely on the native projection being
+                    # generated from the canonical name + content document.
+                    conn.execute(
+                        text(f"""
+                            ALTER TABLE {schema_name}.{table_name}
+                            ADD COLUMN search_vector tsvector
+                            GENERATED ALWAYS AS (
+                                to_tsvector('english', COALESCE(name, '') || ' ' || COALESCE(content, ''))
+                            ) STORED
+                        """)
+                    )
+                else:
+                    # memory_units writes populate this plain column with the
+                    # configured native language in ops_postgresql.
+                    conn.execute(text(f"ALTER TABLE {schema_name}.{table_name} ADD COLUMN search_vector tsvector"))
 
                 # Create GIN index
                 logger.info(f"Creating GIN index on {table_name}")

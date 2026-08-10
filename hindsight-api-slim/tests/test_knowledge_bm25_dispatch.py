@@ -31,10 +31,12 @@ def test_native_uses_tsvector_operators():
     assert arm.match_filter == "AND mm.search_vector @@ websearch_to_tsquery('english', $3)"
 
 
-def test_pgroonga_is_served_by_the_native_branch():
-    # mental_models is never reconciled to pgroonga structures, so it keeps the
-    # generated tsvector column and must use the native operators.
-    assert knowledge_bm25_arm("pgroonga", table_alias="mm", text_param="$3") == _arm("native")
+def test_pgroonga_uses_multilingual_expression_index():
+    arm = _arm("pgroonga")
+    assert arm.score_expr == "pgroonga_score(mm.tableoid, mm.ctid)"
+    assert arm.order_by == "pgroonga_score(mm.tableoid, mm.ctid) DESC"
+    assert arm.match_filter == ("AND (COALESCE(mm.name, '') || ' ' || mm.content) &@~ pgroonga_query_escape($3)")
+    assert "ts_rank_cd" not in arm.score_expr
 
 
 def test_pg_search_uses_paradedb_over_base_columns():

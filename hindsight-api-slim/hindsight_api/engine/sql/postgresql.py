@@ -45,10 +45,8 @@ def knowledge_bm25_arm(
     ``table_alias`` is the alias the ``mental_models`` row carries in the query
     (``mm``); ``text_param`` is the bind placeholder holding the query text.
 
-    ``pgroonga`` is intentionally served by the native branch: the
-    ``mental_models`` table is never reconciled to pgroonga structures
-    (``ensure_text_search_extension`` checks the pre-rename ``reflections`` name),
-    so it keeps the migration-time generated tsvector column.
+    PGroonga keeps the migration-time generated tsvector as a rollback projection,
+    but queries the multilingual expression index over ``name + content``.
     """
     a = table_alias
     p = text_param
@@ -93,7 +91,18 @@ def knowledge_bm25_arm(
             match_filter="",
         )
 
-    # native (and pgroonga — see docstring): generated tsvector over name + content.
+    if text_search_extension == "pgroonga":
+        score = f"pgroonga_score({a}.tableoid, {a}.ctid)"
+        # Repeat idx_mental_models_text_search's expression exactly so PostgreSQL
+        # can select the PGroonga expression index.
+        document = f"(COALESCE({a}.name, '') || ' ' || {a}.content)"
+        return KnowledgeBm25Arm(
+            score_expr=score,
+            order_by=f"{score} DESC",
+            match_filter=f"AND {document} &@~ pgroonga_query_escape({p})",
+        )
+
+    # native: generated tsvector over name + content.
     # The generating expression hard-codes the 'english' config (see the
     # learnings/pinned_reflections migration), so query with 'english' regardless
     # of the configured native language.
