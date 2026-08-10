@@ -102,6 +102,20 @@ class DataAccessOps(ABC):
         """
         return True  # Default: use junction table (Oracle)
 
+    def mental_model_search_vector_expr(
+        self,
+        config: Any,
+        *,
+        name_col: str = "name",
+        content_col: str = "content",
+    ) -> str | None:
+        """Stored lexical projection for a mental-model document, if any.
+
+        Oracle and PostgreSQL base-column search backends maintain no stored
+        projection here. PostgreSQL VChord overrides this capability.
+        """
+        return None
+
     # -- Bulk insert operations ------------------------------------------
 
     @abstractmethod

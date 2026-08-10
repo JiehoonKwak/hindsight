@@ -816,10 +816,7 @@ def ensure_text_search_extension(
     engine = create_engine(to_libpq_url(database_url), poolclass=NullPool)
     with engine.connect() as conn:
         # Tables with search_vector columns to check
-        tables_to_check = [
-            "memory_units",
-            "reflections",  # Renamed from pinned_reflections in p1k2l3m4n5o6 migration
-        ]
+        tables_to_check = ["memory_units", "mental_models"]
 
         # Determine target column type and index type
         if text_search_extension == "vchord":
@@ -933,6 +930,21 @@ def ensure_text_search_extension(
 
         # If no mismatches, we're done
         if not mismatched_tables:
+            if text_search_extension == "vchord":
+                # VChord's bm25vector is not generated. Older mental-model write
+                # paths never populated it, so a physically-correct deployment
+                # can still have a completely empty lexical index.
+                conn.execute(
+                    text(f"""
+                        UPDATE {schema_name}.mental_models
+                        SET search_vector = tokenize(
+                            COALESCE(name, '') || ' ' || COALESCE(content, ''),
+                            'llmlingua2'
+                        )::bm25_catalog.bm25vector
+                        WHERE search_vector IS NULL
+                    """)
+                )
+                conn.commit()
             logger.debug(f"All text search columns/indexes match configured extension: {text_search_extension}")
             return
 
@@ -960,7 +972,7 @@ def ensure_text_search_extension(
                 f"the following tables contain data: {table_list}. "
                 f"To change text search extension, you must either:\n"
                 f"  1. Clear all data: DELETE FROM {schema_name}.memory_units; "
-                f"DELETE FROM {schema_name}.reflections; then restart\n"
+                f"DELETE FROM {schema_name}.mental_models; then restart\n"
                 f"  2. Use the current text search extension (set HINDSIGHT_API_TEXT_SEARCH_EXTENSION='{current_ext}')"
             )
 
@@ -1009,7 +1021,7 @@ def ensure_text_search_extension(
                 # Different expression for each table
                 if table_name == "memory_units":
                     index_expr = "(COALESCE(text, '') || ' ' || COALESCE(context, ''))"
-                else:  # reflections
+                else:  # mental_models
                     index_expr = "(COALESCE(name, '') || ' ' || content)"
 
                 conn.execute(
@@ -1041,7 +1053,7 @@ def ensure_text_search_extension(
                     index_expr = (
                         "(COALESCE(text, '') || ' ' || COALESCE(context, '') || ' ' || COALESCE(text_signals, ''))"
                     )
-                else:  # reflections
+                else:  # mental_models
                     index_expr = "(COALESCE(name, '') || ' ' || content)"
 
                 logger.info(f"Creating pgroonga index on {table_name}")
@@ -1070,7 +1082,7 @@ def ensure_text_search_extension(
                         ("text", "context", "text_signals"),
                         pg_search_tokenizer,
                     )
-                else:  # reflections
+                else:  # mental_models
                     bm25_cols = pg_search_bm25_columns(
                         "id",
                         ("name", "content"),
@@ -1088,11 +1100,23 @@ def ensure_text_search_extension(
                 )
             else:  # native
                 logger.info(f"Creating tsvector column on {table_name}")
-                # Plain tsvector column. The application populates search_vector
-                # at INSERT time via to_tsvector($lang, ...) using the configured
-                # HINDSIGHT_API_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE — see
-                # ops_postgresql.insert_facts_batch.
-                conn.execute(text(f"ALTER TABLE {schema_name}.{table_name} ADD COLUMN search_vector tsvector"))
+                if table_name == "mental_models":
+                    # Mental models existed with a generated native column before
+                    # runtime reconciliation learned about text backends. Preserve
+                    # that contract so every name/content write stays current.
+                    conn.execute(
+                        text(f"""
+                            ALTER TABLE {schema_name}.{table_name}
+                            ADD COLUMN search_vector tsvector
+                            GENERATED ALWAYS AS (
+                                to_tsvector('english', COALESCE(name, '') || ' ' || COALESCE(content, ''))
+                            ) STORED
+                        """)
+                    )
+                else:
+                    # Memory-unit writes populate this plain column with the
+                    # configured native language in ops_postgresql.
+                    conn.execute(text(f"ALTER TABLE {schema_name}.{table_name} ADD COLUMN search_vector tsvector"))
 
                 # Create GIN index
                 logger.info(f"Creating GIN index on {table_name}")

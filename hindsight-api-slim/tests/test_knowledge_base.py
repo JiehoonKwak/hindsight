@@ -319,6 +319,25 @@ class TestMoveRenameDelete:
         assert resp.status_code == 200, resp.text
         assert resp.json()["name"] == "Compliance"
 
+    async def test_page_rename_updates_backing_mental_model(
+        self, api_client, kb_bank, memory: MemoryEngine, request_context
+    ):
+        bank_id, ids = kb_bank
+        resp = await api_client.patch(
+            f"/v1/default/banks/{_enc(bank_id)}/knowledge-base/nodes/{ids.orders}",
+            json={"name": "Order Operations"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["name"] == "Order Operations"
+
+        mental_model = await memory.get_mental_model(
+            bank_id,
+            ids.orders_mm,
+            request_context=request_context,
+        )
+        assert mental_model is not None
+        assert mental_model["name"] == "Order Operations"
+
     async def test_update_page_options(self, api_client, kb_bank):
         bank_id, ids = kb_bank
         resp = await api_client.patch(

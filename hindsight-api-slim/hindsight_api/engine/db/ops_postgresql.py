@@ -38,8 +38,40 @@ def pg_search_vector_expr(
     return None
 
 
+def pg_mental_model_search_vector_expr(
+    config,
+    *,
+    name_col: str = "name",
+    content_col: str = "content",
+) -> str | None:
+    """Build the stored lexical projection for a mental-model document.
+
+    VChord is the only backend whose mental-model projection must be written by
+    the application. Native PostgreSQL uses a generated ``tsvector`` column,
+    while pg_textsearch, PGroonga, and pg_search index ``name``/``content``
+    directly and retain only a dummy ``search_vector`` column.
+    """
+    if config.text_search_extension != "vchord":
+        return None
+    combined = f"COALESCE({name_col}, '') || ' ' || COALESCE({content_col}, '')"
+    return f"tokenize({combined}, 'llmlingua2')::bm25_catalog.bm25vector"
+
+
 class PostgreSQLOps(DataAccessOps):
     """PostgreSQL-specific data access operations using unnest and LATERAL."""
+
+    def mental_model_search_vector_expr(
+        self,
+        config,
+        *,
+        name_col: str = "name",
+        content_col: str = "content",
+    ) -> str | None:
+        return pg_mental_model_search_vector_expr(
+            config,
+            name_col=name_col,
+            content_col=content_col,
+        )
 
     @property
     def uses_observation_sources_table(self) -> bool:

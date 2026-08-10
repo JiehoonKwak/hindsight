@@ -195,6 +195,49 @@ class TestMentalModelsCRUD:
         await memory.delete_bank(bank_id, request_context=request_context)
 
     @pytest.mark.asyncio
+    async def test_name_only_update_rebuilds_canonical_search_document(
+        self, memory: MemoryEngine, request_context, monkeypatch
+    ):
+        """A name-only edit embeds stored content and refreshes native FTS."""
+        from hindsight_api.engine.retain import embedding_utils
+
+        bank_id = f"test-mental-model-name-{uuid.uuid4().hex[:8]}"
+        mental_model = await memory.create_mental_model(
+            bank_id=bank_id,
+            name="Original Name",
+            source_query="Original Query",
+            content="Canonical Body",
+            request_context=request_context,
+        )
+
+        original_generate = embedding_utils.generate_embeddings_batch
+        embedded_documents: list[list[str]] = []
+
+        async def recording_generate(*args, **kwargs):
+            embedded_documents.append(args[1])
+            return await original_generate(*args, **kwargs)
+
+        monkeypatch.setattr(embedding_utils, "generate_embeddings_batch", recording_generate)
+        updated = await memory.update_mental_model(
+            bank_id=bank_id,
+            mental_model_id=mental_model["id"],
+            name="Updated Name",
+            request_context=request_context,
+        )
+
+        assert updated is not None and updated["name"] == "Updated Name"
+        assert embedded_documents == [["Updated Name Canonical Body"]]
+        async with memory._pool.acquire() as conn:
+            search_vector = await conn.fetchval(
+                "SELECT search_vector::text FROM mental_models WHERE bank_id = $1 AND id = $2",
+                bank_id,
+                mental_model["id"],
+            )
+        assert "updat" in search_vector
+        assert "canon" in search_vector
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
     async def test_delete_mental_model(self, memory: MemoryEngine, request_context):
         """Test deleting a mental model."""
         bank_id = f"test-mental-model-delete-{uuid.uuid4().hex[:8]}"

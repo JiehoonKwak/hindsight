@@ -946,6 +946,29 @@ class TestPostgreSQLSearchVector:
         # These index the base text columns directly; search_vector stays empty.
         assert pg_search_vector_expr(self._cfg(ext)) is None
 
+    def test_mental_model_expr_builds_vchord_name_content_document(self):
+        from hindsight_api.engine.db.ops_postgresql import PostgreSQLOps
+
+        expr = PostgreSQLOps().mental_model_search_vector_expr(
+            self._cfg("vchord"),
+            name_col="$3",
+            content_col="$4",
+        )
+        assert expr is not None
+        assert "COALESCE($3, '') || ' ' || COALESCE($4, '')" in expr
+        assert "tokenize(" in expr and "::bm25_catalog.bm25vector" in expr
+
+    @pytest.mark.parametrize("ext", ["native", "pgroonga", "pg_textsearch", "pg_search"])
+    def test_mental_model_expr_none_when_database_maintains_base_document(self, ext):
+        from hindsight_api.engine.db.ops_postgresql import PostgreSQLOps
+
+        assert PostgreSQLOps().mental_model_search_vector_expr(self._cfg(ext)) is None
+
+    def test_oracle_mental_model_search_document_has_no_stored_projection(self):
+        from hindsight_api.engine.db.ops_oracle import OracleOps
+
+        assert OracleOps().mental_model_search_vector_expr(self._cfg("native")) is None
+
     def test_expr_accepts_custom_column_refs(self):
         from hindsight_api.engine.db.ops_postgresql import pg_search_vector_expr
 
