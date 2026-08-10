@@ -70,7 +70,9 @@ _REPLAYED_TABLES = frozenset(
 )
 # Carried verbatim as JSON rows (bank config + synthesized state). Embedding-bearing
 # rows have their vector stripped (see _DERIVED_COLUMNS) and are re-embedded on import.
-_BANK_ROW_TABLES = ("banks", "mental_models", "directives", "webhooks")
+# Knowledge Pages retain stable ids and their backing mental-model ids; import
+# restores their self-referential tree parent-first.
+_BANK_ROW_TABLES = ("banks", "mental_models", "knowledge_pages", "directives", "webhooks")
 # Bank-scoped child-history carried verbatim. Unlike observations, mental models
 # keep their (id, bank_id) across export/import, so their refresh history can be
 # re-attached. The surrogate ``id`` is dropped on dump so the target reassigns it
@@ -88,12 +90,6 @@ _SKIP_TABLES = frozenset(
         # to fresh ids, so carrying them would only produce dangling associations.
         # Revert anything worth keeping on the source before migrating.
         "invalidated_memory_units",
-        # Knowledge-base folder/page tree (client-managed metadata over the carried
-        # mental models). Not carried yet: its self-referential parent_id FK needs a
-        # parents-first (topological) restore order, which the generic per-row
-        # _restore_rows doesn't provide — a follow-up. The mental models themselves
-        # ARE carried, so the target can recreate the tree.
-        "knowledge_pages",
     }
 )
 # Derived columns dropped from carried rows so the target regenerates them with
@@ -294,11 +290,11 @@ async def export_bank(
 
     Produces a superset of the documents archive: the logical
     document/fact/observation export (replayed and re-embedded on import) plus
-    the bank's config, mental models, directives and webhooks as JSON rows. With
-    ``include_history`` the operational tails (audit_log, llm_requests) are also
-    carried. Intended for migrating a bank to a new instance configured with a
-    different embedding model / vector / text-search backend — every vector is
-    regenerated on the target, so nothing here is encoder-specific.
+    the bank's config, mental models, Knowledge Page tree, directives and webhooks
+    as JSON rows. With ``include_history`` the operational tails (audit_log,
+    llm_requests) are also carried. Intended for migrating a bank to a new instance
+    configured with a different embedding model / vector / text-search backend —
+    every vector is regenerated on the target, so nothing here is encoder-specific.
 
     ``conn`` is a live connection scoped to the bank's schema (the admin CLI sets
     ``_current_schema`` and passes its raw connection; the engine acquires one
@@ -343,6 +339,7 @@ async def export_bank(
             observation_count=len(observations),
             archive_type="bank",
             mental_model_count=len(bank_rows.get("mental_models", [])),
+            knowledge_page_count=len(bank_rows.get("knowledge_pages", [])),
             directive_count=len(bank_rows.get("directives", [])),
             webhook_count=len(bank_rows.get("webhooks", [])),
             includes_history=include_history,
@@ -352,12 +349,13 @@ async def export_bank(
 
     logger.info(
         "[transfer] Exported bank %s: %d document(s), %d fact(s), %d observation(s), "
-        "%d mental model(s), %d directive(s), %d webhook(s)%s",
+        "%d mental model(s), %d Knowledge Page node(s), %d directive(s), %d webhook(s)%s",
         bank_id,
         len(documents),
         fact_total,
         len(observations),
         len(bank_rows.get("mental_models", [])),
+        len(bank_rows.get("knowledge_pages", [])),
         len(bank_rows.get("directives", [])),
         len(bank_rows.get("webhooks", [])),
         " (with history)" if include_history else "",

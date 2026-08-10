@@ -228,9 +228,10 @@ async def import_documents(
     return result
 
 
-# Bank-level config/state tables restored verbatim from a whole-bank archive.
-# Order matters for foreign keys: banks (parent) is restored before any child.
-_BANK_CHILD_TABLES = ("mental_models", "directives", "webhooks")
+# Bank-level config/state tables restored from a whole-bank archive. Order matters
+# for foreign keys: banks precede every child; mental_models precede their
+# Knowledge Pages; Knowledge Page parents precede children.
+_BANK_CHILD_TABLES = ("mental_models", "knowledge_pages", "directives", "webhooks")
 # Child-history carried verbatim; restored after its parent (mental_models) so the
 # foreign key resolves. Surrogate ids were dropped on export (the target reassigns
 # them), so these restore via fresh IDENTITY values.
@@ -245,6 +246,7 @@ class BankImportResult:
     facts_imported: int = 0
     observations_imported: int = 0
     mental_models_imported: int = 0
+    knowledge_pages_imported: int = 0
     mental_model_history_imported: int = 0
     directives_imported: int = 0
     webhooks_imported: int = 0
@@ -256,7 +258,8 @@ class ParsedBankArchive:
     """The bank-level sections of a whole-bank archive (documents read separately)."""
 
     manifest: TransferManifest
-    # table name -> list of verbatim row dicts (banks, mental_models, directives, webhooks)
+    # table name -> carried row dicts (banks, mental_models, Knowledge Pages,
+    # directives, webhooks)
     bank_rows: dict[str, list[dict]] = field(default_factory=dict)
     # table name -> rows (audit_log, llm_requests), present only with --include-history
     history_rows: dict[str, list[dict]] = field(default_factory=dict)
@@ -349,6 +352,124 @@ async def _restore_rows(
     return inserted
 
 
+def _knowledge_pages_parent_first(rows: list[dict]) -> list[dict]:
+    """Return a stable parent-before-child ordering for a Knowledge Page tree.
+
+    The table has a self-referential ``parent_id`` foreign key, so archive order
+    is not a valid restore order. Reject dangling parents and cycles before any
+    import writes occur instead of leaving a partially restored tree.
+    """
+    if not rows:
+        return []
+
+    row_ids = [row.get("id") for row in rows]
+    if any(row_id is None for row_id in row_ids):
+        raise ValueError("Invalid Knowledge Pages archive: every node must have an id")
+    if len(set(row_ids)) != len(row_ids):
+        raise ValueError("Invalid Knowledge Pages archive: duplicate node id")
+
+    known_ids = set(row_ids)
+    missing_parents = {
+        row.get("parent_id")
+        for row in rows
+        if row.get("parent_id") is not None and row.get("parent_id") not in known_ids
+    }
+    if missing_parents:
+        raise ValueError(f"Invalid Knowledge Pages archive: missing parent node(s): {sorted(missing_parents)!r}")
+
+    ordered: list[dict] = []
+    restored_ids: set[Any] = set()
+    pending = list(rows)
+    while pending:
+        ready = [row for row in pending if row.get("parent_id") is None or row.get("parent_id") in restored_ids]
+        if not ready:
+            unresolved = sorted(str(row["id"]) for row in pending)
+            raise ValueError(f"Invalid Knowledge Pages archive: parent cycle among node(s): {unresolved!r}")
+        for row in ready:
+            ordered.append(row)
+            restored_ids.add(row["id"])
+        ready_ids = {id(row) for row in ready}
+        pending = [row for row in pending if id(row) not in ready_ids]
+    return ordered
+
+
+def _validate_knowledge_page_models(rows: list[dict], mental_model_rows: list[dict]) -> None:
+    """Reject Knowledge Page nodes that cannot preserve their source meaning.
+
+    A folder is structural and must not reference a mental model. A page is a
+    projection of exactly one carried mental model, so accepting a missing or
+    dangling reference would either fail after document replay or silently
+    restore a page with no content.
+    """
+    mental_model_ids = {row.get("id") for row in mental_model_rows if row.get("id") is not None}
+    nodes_by_id = {row.get("id"): row for row in rows}
+    for row in rows:
+        node_id = row.get("id")
+        kind = row.get("kind")
+        mental_model_id = row.get("mental_model_id")
+        if kind == "folder":
+            if mental_model_id is not None:
+                raise ValueError(f"Invalid Knowledge Pages archive: folder '{node_id}' references a mental model")
+        elif kind == "page":
+            if mental_model_id is None or mental_model_id not in mental_model_ids:
+                raise ValueError(
+                    f"Invalid Knowledge Pages archive: page '{node_id}' references missing mental model "
+                    f"'{mental_model_id}'"
+                )
+        else:
+            raise ValueError(f"Invalid Knowledge Pages archive: node '{node_id}' has unsupported kind '{kind}'")
+
+        parent_id = row.get("parent_id")
+        if parent_id is not None and nodes_by_id[parent_id].get("kind") != "folder":
+            raise ValueError(f"Invalid Knowledge Pages archive: parent '{parent_id}' is not a folder")
+
+
+async def _reembed_mental_model_rows(rows: list[dict], embeddings_model: Any) -> list[dict]:
+    """Attach target-model embeddings to carried mental-model rows.
+
+    Export deliberately strips encoder-specific vectors. Generate every target
+    vector before the import writes its bank row so an embedding failure cannot
+    leave a half-created target bank.
+    """
+    if not rows:
+        return []
+    texts = [f"{row.get('name') or ''} {row.get('content') or ''}" for row in rows]
+    embeddings = await embedding_processing.generate_embeddings_batch(embeddings_model, texts)
+    if len(embeddings) != len(rows):
+        raise RuntimeError(
+            f"Mental-model embedding count mismatch during bank import: expected {len(rows)}, got {len(embeddings)}"
+        )
+    return [{**row, "embedding": str(embedding)} for row, embedding in zip(rows, embeddings)]
+
+
+async def _restore_mental_models(
+    conn: Any,
+    rows: list[dict],
+    *,
+    bank_id: str,
+    config: Any,
+    ops: Any,
+    bank_rows_json_encoding: BankRowsJSONEncoding,
+) -> int:
+    """Restore carried mental models and rebuild the target text projection."""
+    inserted = await _restore_rows(
+        conn,
+        "mental_models",
+        rows,
+        bank_rows_json_encoding=bank_rows_json_encoding,
+    )
+    # Native PostgreSQL regenerates its generated tsvector on INSERT, while
+    # base-column backends index name/content directly. VChord is the only
+    # backend needing an application-maintained mental-model projection.
+    search_vector_expr = ops.mental_model_search_vector_expr(config)
+    if inserted and search_vector_expr:
+        await conn.execute(
+            f"UPDATE {fq_table('mental_models')} SET search_vector = {search_vector_expr} WHERE bank_id = $1",
+            bank_id,
+        )
+    return inserted
+
+
 async def import_bank(
     *,
     backend: Any,
@@ -363,9 +484,11 @@ async def import_bank(
 ) -> BankImportResult:
     """Restore a whole bank from a ``export_bank`` archive into the target instance.
 
-    Re-embeds facts with the *target* instance's embedding model and rebuilds links,
-    entities and search/vector indexes — the path for migrating a bank to an instance
-    configured with a different embedding model / vector / text-search backend.
+    Re-embeds facts and mental models with the *target* instance's embedding model,
+    rebuilds their search projections, and rebuilds links/entities — the path for
+    migrating a bank to an instance configured with a different embedding model /
+    vector / text-search backend. Knowledge Page ids, hierarchy and backing
+    mental-model references are preserved.
 
     The **target bank must not already exist**: import restores a complete bank
     (config + facts + mental models + …) and is not a merge. If a bank with the
@@ -394,6 +517,30 @@ async def import_bank(
             for row in rows:
                 if "bank_id" in row:
                     row["bank_id"] = bank_id
+
+    # Validate all Knowledge Page relationships before the first write. These can
+    # fail independently of PostgreSQL and should leave no partially-created
+    # target bank.
+    knowledge_page_rows = _knowledge_pages_parent_first(parsed.bank_rows.get("knowledge_pages", []))
+    raw_mental_model_rows = parsed.bank_rows.get("mental_models", [])
+    _validate_knowledge_page_models(knowledge_page_rows, raw_mental_model_rows)
+
+    # Fail an obvious existing-target import before paying to embed mental
+    # models. The guarded check immediately before INSERT remains below so two
+    # concurrent importers cannot race this preflight into a merge.
+    async with acquire_with_retry(backend) as conn:
+        if await conn.fetchval(f"SELECT 1 FROM {fq_table('banks')} WHERE bank_id = $1", bank_id):
+            raise ValueError(
+                f"Target bank '{bank_id}' already exists; import-bank restores into a fresh bank "
+                f"(it is not a merge). Delete the bank first, or pass a different target bank id."
+            )
+
+    # Generate every target-model vector before creating the bank, so an
+    # embedding-provider failure cannot leave a partially restored target.
+    mental_model_rows = await _reembed_mental_model_rows(
+        raw_mental_model_rows,
+        embeddings_model,
+    )
 
     async with acquire_with_retry(backend) as conn:
         # Refuse to import into an existing bank — this restores a whole bank, it
@@ -452,10 +599,18 @@ async def import_bank(
         observations_imported=doc_result.observations_imported,
     )
     async with acquire_with_retry(backend) as conn:
-        result.mental_models_imported = await _restore_rows(
+        result.mental_models_imported = await _restore_mental_models(
             conn,
-            "mental_models",
-            parsed.bank_rows.get("mental_models", []),
+            mental_model_rows,
+            bank_id=bank_id,
+            config=config,
+            ops=ops,
+            bank_rows_json_encoding=bank_rows_json_encoding,
+        )
+        result.knowledge_pages_imported = await _restore_rows(
+            conn,
+            "knowledge_pages",
+            knowledge_page_rows,
             bank_rows_json_encoding=bank_rows_json_encoding,
         )
         # Restored after mental_models so the (mental_model_id, bank_id) FK resolves.
@@ -488,12 +643,14 @@ async def import_bank(
 
     logger.info(
         "[transfer] Imported bank %s: %d doc(s), %d fact(s), %d observation(s), "
-        "%d mental model(s), %d mm-history row(s), %d directive(s), %d webhook(s), %d history row(s)",
+        "%d mental model(s), %d Knowledge Page node(s), %d mm-history row(s), "
+        "%d directive(s), %d webhook(s), %d history row(s)",
         bank_id,
         result.documents_imported,
         result.facts_imported,
         result.observations_imported,
         result.mental_models_imported,
+        result.knowledge_pages_imported,
         result.mental_model_history_imported,
         result.directives_imported,
         result.webhooks_imported,

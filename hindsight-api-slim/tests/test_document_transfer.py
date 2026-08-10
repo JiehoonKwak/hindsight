@@ -10,6 +10,8 @@ import json
 import uuid
 import zipfile
 from datetime import datetime, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -209,6 +211,85 @@ def test_export_bank_covers_schema():
     assert sum(len(b) for b in buckets) == len(classified), "a table is classified in more than one bucket"
 
 
+def test_knowledge_pages_restore_order_is_parent_first_and_rejects_bad_trees():
+    from hindsight_api.engine.transfer.importer import (
+        _knowledge_pages_parent_first,
+        _validate_knowledge_page_models,
+    )
+
+    rows = [
+        {"id": "grandchild", "parent_id": "child"},
+        {"id": "child", "parent_id": "root"},
+        {"id": "root", "parent_id": None},
+        {"id": "other-root", "parent_id": None},
+    ]
+    assert [row["id"] for row in _knowledge_pages_parent_first(rows)] == [
+        "root",
+        "other-root",
+        "child",
+        "grandchild",
+    ]
+
+    with pytest.raises(ValueError, match="missing parent"):
+        _knowledge_pages_parent_first([{"id": "orphan", "parent_id": "missing"}])
+    with pytest.raises(ValueError, match="parent cycle"):
+        _knowledge_pages_parent_first(
+            [
+                {"id": "a", "parent_id": "b"},
+                {"id": "b", "parent_id": "a"},
+            ]
+        )
+
+    mental_models = [{"id": "mm-page"}]
+    valid_rows = [
+        {"id": "folder", "parent_id": None, "kind": "folder", "mental_model_id": None},
+        {"id": "page", "parent_id": "folder", "kind": "page", "mental_model_id": "mm-page"},
+    ]
+    _validate_knowledge_page_models(valid_rows, mental_models)
+
+    with pytest.raises(ValueError, match="missing mental model"):
+        _validate_knowledge_page_models(
+            [{"id": "page", "parent_id": None, "kind": "page", "mental_model_id": "mm-missing"}],
+            mental_models,
+        )
+    with pytest.raises(ValueError, match="is not a folder"):
+        _validate_knowledge_page_models(
+            [
+                {"id": "page-1", "parent_id": None, "kind": "page", "mental_model_id": "mm-page"},
+                {"id": "page-2", "parent_id": "page-1", "kind": "page", "mental_model_id": "mm-page"},
+            ],
+            mental_models,
+        )
+
+
+@pytest.mark.asyncio
+async def test_mental_model_restore_rebuilds_backend_projection(monkeypatch):
+    from hindsight_api.engine.transfer import importer
+
+    restore_rows = AsyncMock(return_value=2)
+    monkeypatch.setattr(importer, "_restore_rows", restore_rows)
+    conn = AsyncMock()
+    ops = Mock()
+    ops.mental_model_search_vector_expr.return_value = (
+        "tokenize(COALESCE(name, '') || ' ' || COALESCE(content, ''), 'llmlingua2')::bm25vector"
+    )
+
+    inserted = await importer._restore_mental_models(
+        conn,
+        [{"id": "mm-1"}, {"id": "mm-2"}],
+        bank_id="bank",
+        config=SimpleNamespace(text_search_extension="vchord"),
+        ops=ops,
+        bank_rows_json_encoding="serialized",
+    )
+
+    assert inserted == 2
+    sql, bank_id = conn.execute.await_args.args
+    assert "SET search_vector = tokenize" in sql
+    assert "WHERE bank_id = $1" in sql
+    assert bank_id == "bank"
+
+
 def test_export_jsonb_coercion_preserves_decoded_scalar_string():
     """Admin connections decode JSONB before the transfer exporter sees it."""
     from hindsight_api.engine.transfer.export import _as_jsonb
@@ -297,6 +378,15 @@ async def test_export_bank_contents(memory, request_context):
     webhook_id = uuid.uuid4()
     try:
         await _retain(memory, bank, "Carol lives in Paris.", request_context, "doc-1")
+        folder = await memory.create_knowledge_folder(bank, "Guides", request_context=request_context)
+        await memory.create_knowledge_page(
+            bank,
+            "Paris",
+            "What do we know about Paris?",
+            "Carol lives in Paris.",
+            parent_id=folder["id"],
+            request_context=request_context,
+        )
         backend = await memory._get_backend()
         async with acquire_with_retry(backend) as conn:
             await conn.execute(
@@ -316,19 +406,23 @@ async def test_export_bank_contents(memory, request_context):
             names = set(zf.namelist())
             manifest = TransferManifest.model_validate_json(zf.read("manifest.json"))
             bank_rows = json.loads(zf.read("banks.json"))
+            knowledge_pages = json.loads(zf.read("knowledge_pages.json"))
             webhooks = json.loads(zf.read("webhooks.json"))
 
         assert manifest.archive_type == "bank"
         assert manifest.bank_rows_json_encoding == "serialized"
         assert manifest.document_count == 1
         assert manifest.webhook_count == 1
+        assert manifest.knowledge_page_count == 2
         assert "mental_models.json" in names and "directives.json" in names
+        assert "knowledge_pages.json" in names
         assert "mental_model_history.json" in names
         assert any(d.endswith(".json") and d.startswith("documents/") for d in names)
         # No history files unless requested.
         assert not any(n.startswith("history/") for n in names)
         # The bank row and webhook are carried.
         assert [r["bank_id"] for r in bank_rows] == [bank]
+        assert {row["kind"] for row in knowledge_pages} == {"folder", "page"}
         assert webhooks[0]["bank_id"] == bank and webhooks[0]["url"] == "https://example.com/hook"
         # No embeddings anywhere — the target instance regenerates them.
         assert "embedding" not in archive.decode("utf-8", errors="ignore")
@@ -382,11 +476,25 @@ async def _bank_content_snapshot(memory, bank_id):
             f"SELECT name, content, priority, is_active FROM {fq_table('directives')} WHERE bank_id = $1", bank_id
         )
         mms = await conn.fetch(
-            f"SELECT subtype, name, description, tags FROM {fq_table('mental_models')} WHERE bank_id = $1", bank_id
+            f"SELECT id, subtype, name, description, tags FROM {fq_table('mental_models')} WHERE bank_id = $1",
+            bank_id,
+        )
+        pages = await conn.fetch(
+            f"SELECT id, parent_id, kind, name, mental_model_id, managed, sort_order "
+            f"FROM {fq_table('knowledge_pages')} WHERE bank_id = $1",
+            bank_id,
         )
         null_emb = await conn.fetchval(
             f"SELECT count(*) FROM {fq_table('memory_units')} "
             f"WHERE bank_id = $1 AND fact_type != 'observation' AND embedding IS NULL",
+            bank_id,
+        )
+        null_mm_emb = await conn.fetchval(
+            f"SELECT count(*) FROM {fq_table('mental_models')} WHERE bank_id = $1 AND embedding IS NULL",
+            bank_id,
+        )
+        null_mm_search = await conn.fetchval(
+            f"SELECT count(*) FROM {fq_table('mental_models')} WHERE bank_id = $1 AND search_vector IS NULL",
             bank_id,
         )
     return {
@@ -401,9 +509,23 @@ async def _bank_content_snapshot(memory, bank_id):
         "webhooks": sorted((h["url"], tuple(h["event_types"] or []), h["enabled"]) for h in hooks),
         "directives": sorted((d["name"], d["content"], d["priority"], d["is_active"]) for d in dirs),
         "mental_models": sorted(
-            (m["subtype"], m["name"], m["description"], tuple(sorted(m["tags"] or []))) for m in mms
+            (m["id"], m["subtype"], m["name"], m["description"], tuple(sorted(m["tags"] or []))) for m in mms
+        ),
+        "knowledge_pages": sorted(
+            (
+                p["id"],
+                p["parent_id"],
+                p["kind"],
+                p["name"],
+                p["mental_model_id"],
+                p["managed"],
+                p["sort_order"],
+            )
+            for p in pages
         ),
         "null_embeddings": null_emb,
+        "null_mental_model_embeddings": null_mm_emb,
+        "null_mental_model_search_vectors": null_mm_search,
     }
 
 
@@ -547,10 +669,12 @@ async def test_bank_import_preserves_consolidation_lifecycle(memory, request_con
 @pytest.mark.asyncio
 async def test_bank_export_import_exact_roundtrip(memory, request_context):
     """A whole-bank archive restores EXACT bank content (config, docs, facts,
-    observations, entities, links, webhooks, directives, mental models) with facts
-    re-embedded. Uses export → delete → import so ids round-trip without collisions
-    (mirroring a fresh target instance)."""
+    observations, entities, links, webhooks, directives, mental models and
+    Knowledge Pages with vectors re-embedded. Uses export → delete → import under
+    a different bank id so stable object ids round-trip without collisions while
+    every bank-scoped row is proven to remap to the isolated target bank."""
     bank = _unique_bank("bank_exact")
+    target_bank = _unique_bank("bank_exact_target")
     try:
         await _retain(memory, bank, "Alice works at Google. Bob works at Microsoft.", request_context, "doc-1")
         await _retain(memory, bank, "Carol lives in Paris.", request_context, "doc-2")
@@ -595,26 +719,40 @@ async def test_bank_export_import_exact_roundtrip(memory, request_context):
             tags=["people"],
             request_context=request_context,
         )
+        folder = await memory.create_knowledge_folder(bank, "People", request_context=request_context)
+        await memory.create_knowledge_page(
+            bank,
+            "Locations",
+            "Where do people live?",
+            "Carol lives in Paris.",
+            parent_id=folder["id"],
+            tags=["people"],
+            request_context=request_context,
+        )
 
         before = await _bank_content_snapshot(memory, bank)
         # Sanity: the source genuinely has rich content in every section we carry.
         assert before["facts"] and before["entities"] and before["links"]
         assert before["webhooks"] and before["directives"] and before["mental_models"]
+        assert before["knowledge_pages"]
         assert before["bank"][0] == "My Bank"
 
         from hindsight_api.engine.transfer import export_bank
 
         async with acquire_with_retry(backend) as conn:
             archive = await export_bank(conn, bank)
-        # Delete then restore into the same id — exact round-trip, no PK collisions.
+        # Delete the source to model a separate target database (several carried
+        # object ids are globally unique), then restore under a different bank id
+        # to exercise --target-bank remapping on every carried child row.
         await memory.delete_bank(bank, request_context=request_context)
-        result = await memory.import_bank_async(archive, request_context)
-        assert result.bank_id == bank
+        result = await memory.import_bank_async(archive, request_context, target_bank_id=target_bank)
+        assert result.bank_id == target_bank
         assert result.webhooks_imported == 1
         assert result.directives_imported == 1
-        assert result.mental_models_imported == 1
+        assert result.mental_models_imported == 2
+        assert result.knowledge_pages_imported == 2
 
-        after = await _bank_content_snapshot(memory, bank)
+        after = await _bank_content_snapshot(memory, target_bank)
         # Semantic links are an ANN-approximate retrieval index regenerated from the
         # (re-embedded) facts; their count depends on whether ANN runs incrementally
         # per document (import) or as a final whole-bank pass (original retain), so
@@ -626,8 +764,11 @@ async def test_bank_export_import_exact_roundtrip(memory, request_context):
         assert after_semantic > 0, "semantic links should be regenerated on import"
         # Facts were re-embedded on import (no NULL vectors).
         assert after["null_embeddings"] == 0
+        assert after["null_mental_model_embeddings"] == 0
+        assert after["null_mental_model_search_vectors"] == 0
     finally:
         await memory.delete_bank(bank, request_context=request_context)
+        await memory.delete_bank(target_bank, request_context=request_context)
 
 
 @pytest.mark.asyncio

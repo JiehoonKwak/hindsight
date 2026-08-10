@@ -313,7 +313,7 @@ hindsight-admin worker-status --schema tenant_acme
 
 ### export-bank
 
-Export an entire bank to a portable ZIP archive — documents, facts, observations, bank configuration, mental models, directives, and webhooks. Embeddings are **never** included; they are regenerated on import. This is the source half of a cross-instance migration (e.g. moving to a different embedding model, vector extension, or text-search backend). PostgreSQL only.
+Export an entire bank to a portable ZIP archive — documents, facts, observations, bank configuration, mental models, Knowledge Pages, directives, and webhooks. Embeddings and text-search projections are **never** included; they are regenerated on import. Knowledge Page ids, hierarchy, and backing mental-model references are preserved. This is the source half of a cross-instance migration (e.g. moving to a different embedding model, vector extension, or text-search backend). PostgreSQL only.
 
 ```bash
 hindsight-admin export-bank --bank <BANK_ID> --output <FILE.zip> [OPTIONS]
@@ -343,7 +343,7 @@ Read-only — safe to run against a live instance.
 
 ### import-bank
 
-Restore a whole-bank archive (produced by `export-bank`) into **this** instance. Facts are re-embedded with this instance's configured embedding model and links/indexes are rebuilt; bank configuration, mental models, directives, and webhooks are restored exactly. No LLM fact-extraction runs, and because a migration restores state, it does **not** fire webhooks or re-run consolidation. PostgreSQL only.
+Restore a whole-bank archive (produced by `export-bank`) into **this** instance. Facts and mental models are re-embedded with this instance's configured embedding model and links/indexes/search projections are rebuilt; bank configuration, mental-model content/history, Knowledge Pages, directives, and webhooks are restored. No LLM fact-extraction runs, and because a migration restores state, it does **not** fire webhooks or re-run consolidation. PostgreSQL only.
 
 ```bash
 hindsight-admin import-bank --archive <FILE.zip> [OPTIONS]
@@ -376,7 +376,7 @@ Import restores a **whole bank** (config, facts, mental models, …) — it is *
 
 Changing a bank's **embedding model** (e.g. a 384-dim encoder → a 1024-dim one), **vector extension** (pgvector / vchord / pgvectorscale), or **text-search backend** can't be done in place on a populated bank — the stored vectors and indexes are tied to those settings. Because every embedding and index is a deterministic function of text already on disk, the supported path is to **move the bank to a fresh instance configured with the new settings and re-derive everything there — with no LLM re-extraction**.
 
-`export-bank` / `import-bank` carry documents, facts, observations, bank config, mental models, directives, and webhooks — but never embeddings, which the target instance regenerates with its own model.
+`export-bank` / `import-bank` carry documents, facts, observations, bank config, mental models and their history, Knowledge Pages, directives, and webhooks — but never embeddings or text-search projections, which the target instance regenerates for its own model and backend. Knowledge Page ids, parent-child hierarchy, and backing mental-model references are preserved.
 
 **Blue-green runbook:**
 
